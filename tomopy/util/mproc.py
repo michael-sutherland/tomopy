@@ -53,12 +53,15 @@ Module for multiprocessing tasks.
 from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
+from mpi4py import MPI
 import numpy as np
-import multiprocessing as mp
 import math
-from contextlib import closing
-from .dtype import as_sharedmem
 import logging
+import time
+
+comm = MPI.COMM_WORLD
+rank = comm.Get_rank()
+size = comm.Get_size()
 
 logger = logging.getLogger(__name__)
 
@@ -68,9 +71,75 @@ __copyright__ = "Copyright (c) 2015, UChicago Argonne, LLC."
 __docformat__ = 'restructuredtext en'
 __all__ = ['distribute_jobs']
 
-#global shared variables
-SHARED_ARRAYS = None
-SHARED_OUT = None
+
+def dtype2mpi(dtype):
+    return MPI._typedict[dtype.char]
+ 
+ 
+def size_from_shape(shape):
+    size = 1
+    for dim in shape:
+        size *= dim
+    return size
+
+# scatter numpy array to all nodes
+#TODO: leave fewest jobs for root node (since needs to do communication)
+#TODO: do a better job of evening the number of slices per rank
+def scatter_arr(arr, root=0):#, overlap=0):
+    # first send every node the shape and dtype
+    if rank == root:
+        shape = arr.shape
+        dtype = arr.dtype
+        #flatten array for sending
+        arr = np.ravel(arr, 'C')
+    else:
+        shape = None
+        dtype = None
+    shape = comm.bcast(shape, root=root)
+    dtype = comm.bcast(dtype, root=root)
+    # nodes calculate offsets and sizes for sharing
+    chunk_size = int(math.ceil(shape[0]/size))
+    slice_size = size_from_shape(shape[1:])
+    offsets = [chunk_size * r for r in range(size)]
+    sizes = [chunk_size for _ in range(size)]
+    # remove remainder from last slice
+    sizes[size-1] -= chunk_size * size - shape[0]
+    local_shape = (sizes[rank],)+shape[1:]
+    local_arr = np.empty(local_shape, dtype=dtype)    
+    # scale to slice size for flattened array
+    offsets = [val * slice_size for val in offsets]
+    sizes = [val * slice_size for val in sizes]
+     
+    comm.Scatterv([arr, tuple(sizes), tuple(offsets), dtype2mpi(dtype)], np.ravel(local_arr, 'C'), root=root)
+    local_arr.reshape(local_shape)
+    return local_arr
+
+
+# gather numpy array from all nodes
+#TODO: leave fewest jobs for root node (since needs to do communication)
+#TODO: do a better job of evening the number of slices per rank
+def gather_arr(arr, local_arr, root=0):#, overlap=0):
+    # first send every node the shape and dtype
+    if rank == root:
+        shape = arr.shape
+        #flatten array for receiving
+        arr = np.ravel(arr, 'C')        
+    else:
+        shape = None
+    shape = comm.bcast(shape, root=root)
+    # nodes calculate offsets and sizes for sharing
+    chunk_size = int(math.ceil(shape[0]/size))
+    slice_size = size_from_shape(shape[1:])
+    sizes = [chunk_size for _ in range(size)]
+    offsets = [chunk_size * r for r in range(size)]
+    # remove remainder from last slice
+    sizes[size-1] -= shape[0] - chunk_size * size
+    # scale to slice size for flattened array
+    offsets = [val * slice_size for val in offsets]
+    sizes = [val * slice_size for val in sizes]
+    
+    comm.Gatherv(np.ravel(local_arr, 'C'), [arr, tuple(sizes), tuple(offsets), dtype2mpi(local_arr.dtype)], root=root)
+
 
 def distribute_jobs(arr,
                     func,
@@ -104,119 +173,68 @@ def distribute_jobs(arr,
         but will also remove the dimension from the array.
     out : ndarray, optional
         Output array.  Results of functions will be compiled into this array.
-        If not provided, new array will be created for output.
+        If not provided, last arr will be used for output.
 
     Returns
     -------
     ndarray
         Output array.
     """
-    if isinstance(arr, np.ndarray):
-        arrs = [arr]
-    else:
-        # assume this is multiple arrays
-        arrs = list(arr)
+    # parameters needed for MPI calls
+    arrs = None
+    num_arrs = None
+    
+    if rank == 0:
+        if isinstance(arr, np.ndarray):
+            arrs = [arr]
+        else:
+            # assume this is multiple arrays
+            arrs = list(arr)
 
-    axis_size = arrs[0].shape[axis]
-    # limit chunk size to size of array along axis     
-    if nchunk and nchunk > axis_size:
-        nchunk = axis_size
-    # default ncore to max and limit number of cores to max number
-    if ncore is None or ncore > mp.cpu_count():
-        ncore = mp.cpu_count()
-    # limit number of cores based on nchunk so that all cores are used
-    if ncore > math.ceil(axis_size / (nchunk or 1)):
-        ncore = int(math.ceil(axis_size / (nchunk or 1)))
-    # default nchunk to only use each core for one call
-    if nchunk is None:
-        nchunk = int(math.ceil(axis_size / ncore))
+        num_arrs = len(arrs)
+    num_arrs = comm.bcast(num_arrs)
+
+    if arrs is None:
+        arrs = [None] * num_arrs
 
     # prepare all args (func, args, kwargs)
     # NOTE: args will include shared_arr slice as first arg
     args = args or tuple()
     kwargs = kwargs or dict()
 
-    # prepare global sharedmem arrays
-    shared_arrays = []
-    shared_out = None
-    for arr in arrs:
-        arr_shared = as_sharedmem(arr)
-        shared_arrays.append(arr_shared)
-        if out is not None and np.may_share_memory(arr, out) and \
-            arr.shape == out.shape and arr.dtype == out.dtype:
-            # assume these are the same array
-            shared_out = arr_shared
-    if out is None:
-        # default out to last array in list
-        out = shared_arrays[-1]
-        shared_out = out
-    if shared_out is None:
-        shared_out = as_sharedmem(out)
+    #TODO: decide if parameters always need to be shared
+    args = comm.bcast(args)
+    kwargs = comm.bcast(kwargs)
 
-    # kick off process
-    # testing single threaded
-#    init_shared(shared_arrays, shared_out)
-#    for i in xrange(0, axis_size, nchunk or 1):
-#        logger.warning("loop %d of %d"%(i+1, axis_size))
-#        if nchunk:
-#            _arg_parser((func, args, kwargs, np.s_[i:i+nchunk], axis))
-#        else:
-#            _arg_parser((func, args, kwargs, i, axis))
+    # distribute arrs to all nodes
+    start = time.time()
+    local_arrs = []
+    for i in range(num_arrs):
+        local_arrs.append(scatter_arr(arrs[i]))
+    print("%d: scatter took: %0.2f s" % (rank, time.time() - start))
 
-    # if nchunk is zero, remove dimension from slice.
-    map_args = []
-    for i in xrange(0, axis_size, nchunk or 1):
-        if nchunk:
-            map_args.append((func, args, kwargs, np.s_[i:i+nchunk], axis))                
-        else:
-            map_args.append((func, args, kwargs, i, axis))
-
-    with closing(mp.Pool(processes=ncore,
-                         initializer=init_shared,
-                         initargs=(shared_arrays, shared_out))) as p:
-        if p._pool:
-            proclist = p._pool[:]
-            res = p.map_async(_arg_parser, map_args)
-            try:
-                while not res.ready():
-                    if any(proc.exitcode for proc in proclist):
-                        p.terminate()
-                        raise RuntimeError("Child process terminated before finishing")
-                    res.wait(timeout=1)
-            except KeyboardInterrupt:
-                p.terminate()
-                raise
-        else:
-            p.map(_arg_parser, map_args)
-    try:
-        p.join()
-    except:
-        p.terminate()
-        raise
-
-    # NOTE: will only copy if out wasn't sharedmem
-    out[:] = shared_out[:]
+    # run function
+    local_out = None
+    if nchunk != 0:
+        result = func(*(local_arrs + list(args)), **kwargs)
+        if result is not None:
+            local_out = result
+    else:
+        axis_size = local_arrs[0].shape[0]
+        for i in range(axis_size):
+            flat_arrs = [local_arr[i] for local_arr in local_arrs]
+            result = func(*(flat_arrs + list(args)), **kwargs)
+            if result is not None and not np.may_share_memory(result, local_arrs[-1]):
+                if local_out is None:
+                    local_out = np.empty((axis_size,)+result.shape, dtype=result.dtype)
+                local_out[i] = result[:]
+    
+    # gather result
+    if rank == 0 and out is None:
+        out = arrs[-1]
+    
+    start = time.time()
+    gather_arr(out, local_out or local_arrs[-1])
+    print("%d: gather took: %0.2f s" % (rank, time.time() - start))
     return out
 
-
-def init_shared(shared_arrays, shared_out):
-    global SHARED_ARRAYS
-    global SHARED_OUT
-    SHARED_ARRAYS = shared_arrays
-    SHARED_OUT = shared_out
-
-
-def _arg_parser(params):
-    global SHARED_ARRAYS
-    global SHARED_OUT
-    func, args, kwargs, slc, axis = params
-    func_args = tuple((slice_axis(a, slc, axis) for a in SHARED_ARRAYS)) + args
-    #NOTE: will only copy if actually different arrays
-    result = func(*func_args, **kwargs)
-    if result is not None and isinstance(result, np.ndarray):
-        outslice = slice_axis(SHARED_OUT, slc, axis)
-        outslice[:] = result[:]
-
-# apply slice to specific axis on ndarray
-def slice_axis(arr, slc, axis):
-    return arr[[slice(None) if i != axis else slc for i in xrange(arr.ndim)]]

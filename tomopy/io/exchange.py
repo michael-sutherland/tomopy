@@ -58,6 +58,7 @@ import os.path
 import re
 import tomopy.io.reader as tio
 import logging
+import h5py
 
 logger = logging.getLogger(__name__)
 

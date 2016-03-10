@@ -53,11 +53,16 @@ Module for data normalization.
 from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
+from mpi4py import MPI
 import numpy as np
 import tomopy.util.mproc as mproc
 import tomopy.util.extern as extern
 import tomopy.util.dtype as dtype
 import logging
+
+comm = MPI.COMM_WORLD
+rank = comm.Get_rank()
+size = comm.Get_size()
 
 logger = logging.getLogger(__name__)
 
@@ -96,12 +101,16 @@ def normalize(arr, flat, dark, cutoff=None, ncore=None, out=None):
     ndarray
         Normalized 3D tomographic data.
     """
-    arr = dtype.as_float32(arr)
-    flat = dtype.as_float32(flat)
-    dark = dtype.as_float32(dark)
+    if rank == 0:
+        arr = dtype.as_float32(arr)
+        flat = dtype.as_float32(flat)
+        dark = dtype.as_float32(dark)
 
-    flat = flat.mean(axis=0)
-    dark = dark.mean(axis=0)
+        flat = np.mean(flat, axis=0)
+        dark = np.mean(dark, axis=0)
+
+    if out is None:
+        out = arr
 
     arr = mproc.distribute_jobs(
         arr,
