@@ -90,8 +90,6 @@ def scatter_arr(arr, root=0):#, overlap=0):
     if rank == root:
         shape = arr.shape
         dtype = arr.dtype
-        #flatten array for sending
-        arr = np.ravel(arr, 'C')
     else:
         shape = None
         dtype = None
@@ -99,19 +97,26 @@ def scatter_arr(arr, root=0):#, overlap=0):
     dtype = comm.bcast(dtype, root=root)
     # nodes calculate offsets and sizes for sharing
     chunk_size = int(math.ceil(shape[0]/size))
-    slice_size = size_from_shape(shape[1:])
     offsets = [chunk_size * r for r in range(size)]
     sizes = [chunk_size for _ in range(size)]
     # remove remainder from last slice
     sizes[size-1] -= chunk_size * size - shape[0]
     local_shape = (sizes[rank],)+shape[1:]
-    local_arr = np.empty(local_shape, dtype=dtype)    
-    # scale to slice size for flattened array
-    offsets = [val * slice_size for val in offsets]
-    sizes = [val * slice_size for val in sizes]
-     
-    comm.Scatterv([arr, tuple(sizes), tuple(offsets), dtype2mpi(dtype)], np.ravel(local_arr, 'C'), root=root)
-    local_arr.reshape(local_shape)
+    local_arr = np.empty(local_shape, dtype=dtype)
+
+    # send to all nodes
+    if rank == root:
+        reqs = []
+        for i in range(size):
+            if i != root:
+                data = arr[offsets[i]:offsets[i]+sizes[i]]
+                reqs.append(comm.Isend(data, i))
+        local_arr = arr[offsets[root]:offsets[root]+sizes[root]]
+        MPI.Request.Waitall(reqs)
+    else:
+        comm.Recv(local_arr, source=root)
+
+    print("%d: %s"%(rank, str(local_arr.shape)))
     return local_arr
 
 
@@ -122,23 +127,27 @@ def gather_arr(arr, local_arr, root=0):#, overlap=0):
     # first send every node the shape and dtype
     if rank == root:
         shape = arr.shape
-        #flatten array for receiving
-        arr = np.ravel(arr, 'C')        
     else:
         shape = None
     shape = comm.bcast(shape, root=root)
     # nodes calculate offsets and sizes for sharing
     chunk_size = int(math.ceil(shape[0]/size))
-    slice_size = size_from_shape(shape[1:])
     sizes = [chunk_size for _ in range(size)]
     offsets = [chunk_size * r for r in range(size)]
     # remove remainder from last slice
     sizes[size-1] -= shape[0] - chunk_size * size
-    # scale to slice size for flattened array
-    offsets = [val * slice_size for val in offsets]
-    sizes = [val * slice_size for val in sizes]
     
-    comm.Gatherv(np.ravel(local_arr, 'C'), [arr, tuple(sizes), tuple(offsets), dtype2mpi(local_arr.dtype)], root=root)
+    # all nodes send back to root
+    if rank == root:
+        reqs = []
+        for i in range(size):
+            if i != root:
+                data = arr[offsets[i]:offsets[i]+sizes[i]]
+                reqs.append(comm.Irecv(data, source=i))
+        arr[offsets[root]:offsets[root]+sizes[root]] = local_arr[:]
+        MPI.Request.Waitall(reqs)
+    else:
+        comm.Send(local_arr, dest=root)
 
 
 def distribute_jobs(arr,
