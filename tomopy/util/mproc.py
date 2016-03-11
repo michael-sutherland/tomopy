@@ -234,7 +234,9 @@ def distribute_jobs(arr,
         out = arrs[-1]
     
     start = time.time()
-    gather_arr(out, local_out or local_arrs[-1])
+    if local_out is None:
+        local_out = local_arrs[-1]
+    gather_arr(out, local_out)
     print("%d: gather took: %0.2f s" % (rank, time.time() - start))
     return out
 
