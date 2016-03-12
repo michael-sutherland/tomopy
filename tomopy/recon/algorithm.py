@@ -60,6 +60,11 @@ import tomopy.util.extern as extern
 import tomopy.util.dtype as dtype
 from tomopy.sim.project import get_center
 import logging
+from mpi4py import MPI 
+
+comm = MPI.COMM_WORLD
+rank = comm.Get_rank()
+size = comm.Get_size()
 
 logger = logging.getLogger(__name__)
 
@@ -208,7 +213,11 @@ def recon(
     """
 
     # Initialize tomography data.
-    tomo = init_tomo(tomo, emission, sinogram_order)
+    shape = None
+    if rank == 0:
+        tomo = init_tomo(tomo, emission, sinogram_order, sharedmem=False)
+        shape = tomo.shape
+    shape = comm.bcast(shape)
 
     allowed_kwargs = {
         'art': ['num_gridx', 'num_gridy', 'num_iter'],
@@ -231,7 +240,7 @@ def recon(
     generic_kwargs = ['num_gridx', 'num_gridy', 'options']
 
     # Generate kwargs for the algorithm.
-    kwargs_defaults = _get_algorithm_kwargs(tomo.shape)
+    kwargs_defaults = _get_algorithm_kwargs(shape)
 
     if isinstance(algorithm, six.string_types):
 
@@ -276,14 +285,21 @@ def recon(
             (list(allowed_kwargs.keys()),))
 
     # Generate args for the algorithm.
-    center_arr = get_center(tomo.shape, center)
+    center_arr = get_center(shape, center)
     args = _get_algorithm_args(theta)
 
     # Initialize reconstruction.
-    recon_shape = (tomo.shape[0], kwargs['num_gridx'], kwargs['num_gridy'])
-    recon = _init_recon(recon_shape, init_recon)
-    return _dist_recon(
-        tomo, center_arr, recon, _get_func(algorithm), args, kwargs, ncore, nchunk)
+    recon_shape = (shape[0], kwargs['num_gridx'], kwargs['num_gridy'])
+    recon = _init_recon(recon_shape, init_recon, sharedmem=False)
+
+    return mproc.distribute_jobs(
+        (tomo, center_arr, recon),
+        func=_get_func(algorithm),
+        args=args,
+        kwargs=kwargs,
+        axis=0,
+        ncore=ncore,
+        nchunk=nchunk)
 
 
 # Convert data to floating point emissive type and sinogram order
@@ -345,18 +361,6 @@ def _get_func(algorithm):
     else:
         func = algorithm
     return func
-
-
-def _dist_recon(tomo, center, recon, algorithm, args, kwargs, ncore, nchunk):
-    #assert tomo.flags.aligned
-    return mproc.distribute_jobs(
-        (tomo, center, recon),
-        func=algorithm,
-        args=args,
-        kwargs=kwargs,
-        axis=0,
-        ncore=ncore,
-        nchunk=nchunk)
 
 
 def _get_algorithm_args(theta):
